@@ -2,13 +2,14 @@ name: 编译 TouchTool Debug APK
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ master, main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: 检出代码（含子模块 AndroidBuildConfig）
@@ -42,6 +43,9 @@ jobs:
           else
             echo "仓库根目录没有 fix.patch，本次编译为未修复的原版"
           fi
+
+      - name: 核对编译机时区（应为北京时间）
+        run: date '+%Y-%m-%d %H:%M:%S %Z'
 
       - name: 编译 Debug APK
         run: ./gradlew assembleDebug --stacktrace
