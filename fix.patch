@@ -1,3 +1,16 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 5d4a4c9..997b24b 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -42,7 +42,7 @@ configure<ApplicationExtension> {
+         debug {
+             isMinifyEnabled = false
+             applicationIdSuffix = ".debug"
+-            resValue("string", "app_name", "点击助手Debug")
++            resValue("string", "app_name", "点击助手 Plus")
+         }
+ 
+         release {
 diff --git a/app/src/main/java/top/bogey/touch_tool/bean/action/logic/ParallelExecuteAction.java b/app/src/main/java/top/bogey/touch_tool/bean/action/logic/ParallelExecuteAction.java
 index f2721e7..58d7dae 100644
 --- a/app/src/main/java/top/bogey/touch_tool/bean/action/logic/ParallelExecuteAction.java
@@ -52,7 +65,7 @@ index f2721e7..58d7dae 100644
      }
  
 diff --git a/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSave.java b/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSave.java
-index 854ef11..242b168 100644
+index 854ef11..ad3c2ba 100644
 --- a/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSave.java
 +++ b/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSave.java
 @@ -2,6 +2,8 @@ package top.bogey.touch_tool.bean.save.log;
@@ -64,33 +77,47 @@ index 854ef11..242b168 100644
  import top.bogey.touch_tool.bean.other.log.LogInfo;
  import top.bogey.touch_tool.utils.GsonUtil;
  import top.bogey.touch_tool.utils.tree.ILazyTreeNodeData;
-@@ -12,14 +14,21 @@ public class LogSave implements ITreeNodeDataLoader {
+@@ -12,12 +14,29 @@ public class LogSave implements ITreeNodeDataLoader {
  
      private final MMKV mmkv;
      private final String key;
 +    private final String path;
++    private final String mmapID;
  
      private long time = System.currentTimeMillis();
  
      public LogSave(String key, String path) {
-         this.key = key;
-+        this.path = path;
-         mmkv = MMKV.mmkvWithID(key, MMKV.MULTI_PROCESS_MODE, null, path);
-     }
- 
-+    // 存储文件被外部删除（如清理缓存）后，MMKV 实例失效，读写均返回 null 导致日志加载失败
-+    public boolean isValid() {
-+        return new File(path, key).exists();
++        this(key, path, 0);
 +    }
 +
++    // epoch > 0 表示这个 key 的存储文件曾被外部删过。
++    // 实测 MMKV.removeStorage 无法清掉 MMKV 内部的实例缓存，
++    // 直接 new LogSave 会取回同一个失效实例（表现为「日志加载失败」且只能强杀进程）。
++    // 因此给失效的 key 换一个新 mmapID，强制 MMKV 创建全新实例。
++    public LogSave(String key, String path, int epoch) {
+         this.key = key;
+-        mmkv = MMKV.mmkvWithID(key, MMKV.MULTI_PROCESS_MODE, null, path);
++        this.path = path;
++        this.mmapID = epoch <= 0 ? key : key + "_" + epoch;
++        mmkv = MMKV.mmkvWithID(this.mmapID, MMKV.MULTI_PROCESS_MODE, null, path);
++    }
++
++    // 存储文件被外部删除（如清理缓存）后，MMKV 实例失效，读写均返回 null 导致日志加载失败
++    public boolean isValid() {
++        return new File(path, mmapID).exists();
+     }
+ 
      public LogInfo getLog(String key) {
-         try {
-             return GsonUtil.getAsObject(mmkv.decodeString(key), LogInfo.class, null);
 diff --git a/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSaver.java b/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSaver.java
-index 4626954..8c86574 100644
+index 4626954..61dfe1a 100644
 --- a/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSaver.java
 +++ b/app/src/main/java/top/bogey/touch_tool/bean/save/log/LogSaver.java
-@@ -27,7 +27,17 @@ public class LogSaver {
+@@ -24,10 +24,24 @@ public class LogSaver {
+ 
+     private final static String LOG_DIR = MainApplication.getInstance().getCacheDir().getAbsolutePath() + "/" + AppUtil.LOG_DIR_NAME;
+     private final Map<String, LogSave> saves = new ConcurrentHashMap<>();
++    // 每个 key 被判定「存储文件已丢失」的次数，用于生成新的 mmapID
++    private final Map<String, Integer> epochs = new ConcurrentHashMap<>();
      private final Set<LogSaveListener> listeners = new HashSet<>();
  
      public LogSave getLogSave(String key) {
@@ -98,18 +125,20 @@ index 4626954..8c86574 100644
 +        LogSave logSave = saves.get(key);
 +        if (logSave != null) {
 +            if (logSave.isValid()) return logSave;
-+            // 存储文件已被外部删除：必须先销毁旧实例。
-+            // 否则 MMKV 内部按 mmapID 缓存实例，new LogSave 会取回同一个失效实例，永远读不到数据。
++            // 存储文件已被外部删除。MMKV 按 mmapID 缓存实例，
++            // removeStorage 实测未能清掉该缓存，新实例会复用失效的那一个。
++            // 所以这里递增 epoch，用全新的 mmapID 重建，彻底绕过 MMKV 实例缓存。
 +            logSave.destroy();
-+            saves.remove(key);
++            int epoch = epochs.merge(key, 1, Integer::sum);
++            logSave = new LogSave(key, LOG_DIR, epoch);
++            saves.put(key, logSave);
++            return logSave;
 +        }
-+        logSave = new LogSave(key, LOG_DIR);
-+        saves.put(key, logSave);
-+        return logSave;
++        return saves.computeIfAbsent(key, k -> new LogSave(k, LOG_DIR));
      }
  
      public void addLog(String key, LogInfo log, boolean autoUid) {
-@@ -42,6 +52,14 @@ public class LogSaver {
+@@ -42,6 +56,14 @@ public class LogSaver {
          logSave.clearLog();
      }
  
@@ -124,90 +153,98 @@ index 4626954..8c86574 100644
      public void addListener(LogSaveListener listener) {
          listeners.add(listener);
      }
-diff --git a/app/src/main/java/top/bogey/touch_tool/service/MainAccessibilityService.java b/app/src/main/java/top/bogey/touch_tool/service/MainAccessibilityService.java
-index 30b9c0c..e7f1cf4 100644
---- a/app/src/main/java/top/bogey/touch_tool/service/MainAccessibilityService.java
-+++ b/app/src/main/java/top/bogey/touch_tool/service/MainAccessibilityService.java
-@@ -869,6 +869,34 @@ public class MainAccessibilityService extends AccessibilityService {
-     // 按键 ----------------------------------------------------------------------------- end
- 
-     // 手势 ----------------------------------------------------------------------------- start
-+
-+    private volatile boolean gestureRunning = false;
-+
-+    // 中断正在执行中的无障碍手势。
-+    // 官方机制：dispatchGesture 会取消当前进行中的一切手势（AOSP javadoc 原文），
-+    // 框架并未提供 CancellationSignal 之类的取消接口，唯一手段是派发一个新手势抢占。
-+    // 坐标优先取屏幕外，命中测试必然失败，不产生任何实际点击；
-+    // 少数 ROM 会校验坐标并抛异常，此时退化为状态栏安全点 (0,0)。
-+    public void cancelGesture() {
-+        if (!gestureRunning) return;
-+        gestureRunning = false;
-+        try {
-+            dispatchGesture(buildCancelGesture(-10, -10), null, null);
-+        } catch (Exception e) {
-+            try {
-+                dispatchGesture(buildCancelGesture(0, 0), null, null);
-+            } catch (Exception ignored) {
-+            }
-+        }
-+    }
-+
-+    private GestureDescription buildCancelGesture(int x, int y) {
-+        Path path = new Path();
-+        path.moveTo(x, y);
-+        return new GestureDescription.Builder()
-+                .addStroke(new GestureDescription.StrokeDescription(path, 0, 1))
-+                .build();
-+    }
-     public void runGesture(int x, int y, int time, BooleanResultCallback callback) {
-         if (x >= 0 && y >= 0 && time > 0) {
-             Path path = new Path();
-@@ -885,6 +913,7 @@ public class MainAccessibilityService extends AccessibilityService {
-             return;
-         }
- 
-+        gestureRunning = true;
-         GestureDescription.Builder builder = new GestureDescription.Builder();
-         for (GestureDescription.StrokeDescription strokeDescription : strokeDescriptions) {
-             builder.addStroke(strokeDescription);
-@@ -893,12 +922,14 @@ public class MainAccessibilityService extends AccessibilityService {
-             @Override
-             public void onCompleted(GestureDescription gestureDescription) {
-                 super.onCompleted(gestureDescription);
-+                gestureRunning = false;
-                 if (callback != null) callback.onResult(true);
-             }
- 
-             @Override
-             public void onCancelled(GestureDescription gestureDescription) {
-                 super.onCancelled(gestureDescription);
-+                gestureRunning = false;
-                 if (callback != null) callback.onResult(false);
-             }
-         }, null);
 diff --git a/app/src/main/java/top/bogey/touch_tool/service/TaskRunnable.java b/app/src/main/java/top/bogey/touch_tool/service/TaskRunnable.java
-index dbe1ec2..4a84e7c 100644
+index dbe1ec2..50967e0 100644
 --- a/app/src/main/java/top/bogey/touch_tool/service/TaskRunnable.java
 +++ b/app/src/main/java/top/bogey/touch_tool/service/TaskRunnable.java
-@@ -10,6 +10,7 @@ import java.util.Set;
- import java.util.Stack;
- import java.util.concurrent.Future;
+@@ -20,6 +20,7 @@ import top.bogey.touch_tool.bean.other.log.NormalLog;
+ import top.bogey.touch_tool.bean.save.setting.SettingSaver;
+ import top.bogey.touch_tool.bean.save.log.LogSaver;
+ import top.bogey.touch_tool.bean.task.Task;
++import top.bogey.touch_tool.ui.custom.float_view.TouchPathFloatView;
+ import top.bogey.touch_tool.utils.AppLog;
  
-+import top.bogey.touch_tool.MainApplication;
- import top.bogey.touch_tool.bean.action.Action;
- import top.bogey.touch_tool.bean.action.start.InnerStartAction;
- import top.bogey.touch_tool.bean.action.start.StartAction;
-@@ -194,6 +195,9 @@ public class TaskRunnable implements Runnable {
+ public class TaskRunnable implements Runnable {
+@@ -194,6 +195,7 @@ public class TaskRunnable implements Runnable {
          if (pauseTime >= 0) resume();
          if (future != null) future.cancel(true);
          taskContextStack.forEach(taskContext -> taskContext.setInterrupt(true));
-+        // 任务线程被中断后，系统底层手势不会自动停止，需主动抢占取消
-+        MainAccessibilityService service = MainApplication.getInstance().getService();
-+        if (service != null) service.cancelGesture();
++        TouchPathFloatView.cancelAll();
      }
  
      public void stopCurrent() {
+diff --git a/app/src/main/java/top/bogey/touch_tool/ui/custom/float_view/TouchPathFloatView.java b/app/src/main/java/top/bogey/touch_tool/ui/custom/float_view/TouchPathFloatView.java
+index a1e2bf9..a26d16d 100644
+--- a/app/src/main/java/top/bogey/touch_tool/ui/custom/float_view/TouchPathFloatView.java
++++ b/app/src/main/java/top/bogey/touch_tool/ui/custom/float_view/TouchPathFloatView.java
+@@ -36,10 +36,16 @@ public class TouchPathFloatView extends AppCompatImageView implements FloatInter
+     private final static int LINE_WIDTH = 10;
+     private final static int PADDING = LINE_WIDTH * 2;
+ 
++    private final static java.util.Set<TouchPathFloatView> ACTIVE_VIEWS =
++            java.util.Collections.synchronizedSet(new java.util.HashSet<>());
++
+     private final String tag = UUID.randomUUID().toString();
+ 
+     private final Paint paint;
+     private Canvas canvas = null;
++    private ValueAnimator animator = null;
++    private Runnable pendingHide = null;
++    private boolean dismissed = false;
+ 
+     private List<PathPart> pathParts;
+     private float timeScale;
+@@ -119,7 +125,8 @@ public class TouchPathFloatView extends AppCompatImageView implements FloatInter
+             paint.setStrokeWidth(LINE_WIDTH * 2);
+             pathPart.getPoints().forEach(point -> {
+                 canvas.drawCircle(point.x, point.y, LINE_WIDTH, paint);
+-                postDelayed(() -> animate().alpha(0).withEndAction(this::dismiss), pathPart.getTime());
++                pendingHide = () -> animate().alpha(0).withEndAction(this::dismiss);
++                postDelayed(pendingHide, pathPart.getTime());
+             });
+         } else {
+             int time = 0;
+@@ -128,6 +135,7 @@ public class TouchPathFloatView extends AppCompatImageView implements FloatInter
+             }
+ 
+             ValueAnimator animator = ValueAnimator.ofFloat(0, 1);
++        this.animator = animator;
+             animator.setDuration((long) (time / timeScale));
+             animator.addUpdateListener(animation -> {
+                 float now = animation.getCurrentPlayTime() * timeScale;
+@@ -172,6 +180,7 @@ public class TouchPathFloatView extends AppCompatImageView implements FloatInter
+ 
+     @Override
+     public void show() {
++        ACTIVE_VIEWS.add(this);
+         FloatWindow.with(MainApplication.getInstance().getService())
+                 .setLayout(this)
+                 .setTag(tag)
+@@ -186,6 +195,24 @@ public class TouchPathFloatView extends AppCompatImageView implements FloatInter
+ 
+     @Override
+     public void dismiss() {
++        if (dismissed) return;
++        dismissed = true;
++        if (animator != null) {
++            animator.cancel();
++            animator = null;
++        }
++        if (pendingHide != null) {
++            removeCallbacks(pendingHide);
++            pendingHide = null;
++        }
++        animate().cancel();
++        ACTIVE_VIEWS.remove(this);
+         FloatWindow.dismiss(tag);
+     }
++
++    public static void cancelAll() {
++        for (TouchPathFloatView view : new ArrayList<>(ACTIVE_VIEWS)) {
++            view.dismiss();
++        }
++    }
+ }
 diff --git a/app/src/main/java/top/bogey/touch_tool/ui/play/PlayFloatItemView.java b/app/src/main/java/top/bogey/touch_tool/ui/play/PlayFloatItemView.java
 index 39c595e..08e142f 100644
 --- a/app/src/main/java/top/bogey/touch_tool/ui/play/PlayFloatItemView.java
@@ -354,10 +391,20 @@ index abf263c..a665188 100644
                      })
                      .setNegativeButton(R.string.cancel, null)
 diff --git a/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatView.java b/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatView.java
-index 6cf4703..b12e3ec 100644
+index 6cf4703..073f5b6 100644
 --- a/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatView.java
 +++ b/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatView.java
-@@ -281,8 +281,14 @@ public class LogFloatView extends FrameLayout implements FloatInterface, LogSave
+@@ -139,6 +139,9 @@ public class LogFloatView extends FrameLayout implements FloatInterface, LogSave
+                 binding.expandButton.setIconResource(R.drawable.icon_zoom_out_map);
+ 
+             }
++            // 只有展开状态才允许移出屏幕。收起后浮窗只剩一个小按钮，
++            // 若仍允许出屏，它会缩到屏幕边缘只剩一丁点，既难抓回又容易让人以为浮窗没了。
++            FloatWindow.setAllowOutScreen(tag, expanded);
+             FloatWindow.updateLayoutParam(tag);
+         });
+ 
+@@ -281,8 +284,14 @@ public class LogFloatView extends FrameLayout implements FloatInterface, LogSave
                  .setSpecial(true)
                  .setLocation(EAnchor.BOTTOM_CENTER, 0, -size.getHeight() / 4)
                  .setExistEditText(true)
@@ -372,6 +419,44 @@ index 6cf4703..b12e3ec 100644
      }
  
      @Override
+diff --git a/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatViewAdapter.java b/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatViewAdapter.java
+index 5fd0dcf..b4f6c72 100644
+--- a/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatViewAdapter.java
++++ b/app/src/main/java/top/bogey/touch_tool/ui/tool/log/LogFloatViewAdapter.java
+@@ -13,7 +13,9 @@ import androidx.annotation.NonNull;
+ import com.google.android.material.card.MaterialCardView;
+ 
+ import java.util.ArrayList;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
+ import java.util.regex.Pattern;
+ 
+ import top.bogey.touch_tool.R;
+@@ -66,7 +68,14 @@ public class LogFloatViewAdapter extends TreeAdapter {
+         return 0;
+     }
+ 
++    // 增量添加时已用过的 uid，防止同一条日志被重复加进列表。
++    // 并行节点在每个分支结束各记一次日志；若两次拿到同一个 uid，
++    // 后一次只覆盖存储，界面却会多加一个指向同一条数据的节点，
++    // 表现为「同一条日志显示两遍，点顶部任务名刷新后恢复正常」。
++    private final Set<String> addedUids = new HashSet<>();
++
+     public void setLogSave(LogSave logSave) {
++        addedUids.clear();
+         task = TaskSaver.getInstance().getTask(logSave.getKey());
+ 
+         List<TreeNode> nodeList = new ArrayList<>();
+@@ -92,6 +101,8 @@ public class LogFloatViewAdapter extends TreeAdapter {
+     }
+ 
+     public void addLog(LogSave logSave, LogInfo log) {
++        String uid = log.getUid();
++        if (uid != null && !addedUids.add(uid)) return;
+         TreeNode node = new LazyTreeNode(logSave, log.getUid());
+         addTreeNode(node);
+     }
 diff --git a/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatConfig.java b/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatConfig.java
 index dfc0f66..5dff2c0 100644
 --- a/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatConfig.java
@@ -464,7 +549,7 @@ index ff6134c..55cea07 100644
              config.dragAble = dragAble;
              return this;
 diff --git a/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatWindowHelper.java b/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatWindowHelper.java
-index 40c3ddd..8c18521 100644
+index 40c3ddd..155cdce 100644
 --- a/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatWindowHelper.java
 +++ b/app/src/main/java/top/bogey/touch_tool/utils/float_window_manager/FloatWindowHelper.java
 @@ -43,6 +43,7 @@ public class FloatWindowHelper {
@@ -475,7 +560,7 @@ index 40c3ddd..8c18521 100644
  
      FloatWindowHelper(Context context, FloatConfig config) {
          this.context = context;
-@@ -101,10 +102,24 @@ public class FloatWindowHelper {
+@@ -101,10 +102,35 @@ public class FloatWindowHelper {
  
          viewParent.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
              boolean portrait = DisplayUtil.isPortrait(context);
@@ -489,19 +574,30 @@ index 40c3ddd..8c18521 100644
 +            // 只看横竖屏不够：应用内横屏（如视频全屏）有时不改系统方向，
 +            // 这里把屏幕尺寸变化也当成一次"旋转"处理。
 +            if (portrait == isPortrait && size.equals(lastSize)) return;
++
++            // 旋转前先记下浮窗原本贴哪条边（要用旧屏幕尺寸算，必须在 lastSize 被覆盖之前取）。
++            // 位置是按「离屏幕锚点的偏移」保存的（如 CENTER_RIGHT），横屏后屏幕变宽，
++            // 同一个偏移换算出来的绝对坐标会跑到中间甚至另一侧，
++            // 于是下面 toDockSide 的「就近吸附」就会判成另一边 ——
++            // 表现为「竖屏明明在左边，一横屏就总贴右边」。
++            boolean keepLeft = params.x < lastSize.getWidth() / 2;
++            boolean keepTop = params.y < lastSize.getHeight() / 2;
++            boolean dockHorizontal =
++                    (float) Math.min(params.x, lastSize.getWidth() - params.x) / lastSize.getWidth()
++                            <= (float) Math.min(params.y, lastSize.getHeight() - params.y) / lastSize.getHeight();
++
              isPortrait = portrait;
 +            lastSize = size;
              DisplayUtil.resetStatusBarHeight();
              setRelativePoint(config.anchor, config.gravity, config.location);
-+            // 旋转后屏幕尺寸变了，而 location 是相对屏幕锚点的偏移，
-+            // 直接套用旧偏移会把浮窗甩到屏幕中间。
-+            // 必须补一次吸附，与"手动拖动后松手"走同一条逻辑，
-+            // 否则用户不手动碰一下浮窗，它就一直停在中间。
++            // 先把位置挪回旋转前贴的那条边，再走常规吸附，
++            // 这样「就近吸附」算出来的就是原来那条边，左右/上下偏好不会丢。
++            keepDockEdge(keepLeft, keepTop, dockHorizontal);
 +            viewParent.toDockSide();
              if (config.callback != null) config.callback.onRotate();
          });
  
-@@ -136,7 +151,10 @@ public class FloatWindowHelper {
+@@ -136,7 +162,10 @@ public class FloatWindowHelper {
              });
          }
  
@@ -513,7 +609,7 @@ index 40c3ddd..8c18521 100644
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
              Rect rect = new Rect(0, 0, viewParent.getWidth(), viewParent.getHeight());
              viewParent.setSystemGestureExclusionRects(List.of(rect));
-@@ -162,9 +180,31 @@ public class FloatWindowHelper {
+@@ -162,9 +191,47 @@ public class FloatWindowHelper {
                  }
                  return false;
              });
@@ -527,11 +623,15 @@ index 40c3ddd..8c18521 100644
          }
      }
  
-+    // 兜底：直接检测输入法是否可见，不可见且窗口仍为 FOCUSABLE 时复位，
-+    // 覆盖输入框未失焦但输入法已收起的情况
++    // 兜底：输入法被非返回键方式收起（收起按钮 / 手势）时不产生 KeyEvent，
++    // 窗口会卡在 FOCUSABLE 状态，导致返回键失效、浮窗内其它控件点不动。
++    // ⚠️ 这里必须排除「正在等待输入法弹出」的情况：点击输入框后窗口刚变成 FOCUSABLE，
++    // 输入法还没弹起来，此时若判定为「输入法不可见」并立刻复位，
++    // 就会把窗口打回 NOT_FOCUSABLE，输入法永远弹不出来（表现为光标闪但键盘不出现）。
 +    private void watchKeyboard() {
 +        viewParent.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
 +            if (viewParent.getHeight() <= 0) return;
++            if (hasFocusedEditText(viewParent)) return;   // 正在输入，绝不打断
 +            Rect visibleRect = new Rect();
 +            viewParent.getWindowVisibleDisplayFrame(visibleRect);
 +            int diff = viewParent.getHeight() - visibleRect.height();
@@ -542,10 +642,49 @@ index 40c3ddd..8c18521 100644
 +        });
 +    }
 +
++    // 浮窗里是否还有输入框持有焦点
++    private boolean hasFocusedEditText(View view) {
++        if (view instanceof EditText editText) {
++            if (editText.hasFocus()) return true;
++        } else if (view instanceof ViewGroup viewGroup) {
++            for (int i = 0; i < viewGroup.getChildCount(); i++) {
++                if (hasFocusedEditText(viewGroup.getChildAt(i))) return true;
++            }
++        }
++        return false;
++    }
++
      void showFloatWindow() {
          if (config.animator != null) {
              new Handler(Looper.getMainLooper()).postDelayed(() -> {
-@@ -291,12 +331,33 @@ public class FloatWindowHelper {
+@@ -247,6 +314,26 @@ public class FloatWindowHelper {
+         }
+     }
+ 
++    // 旋转后把浮窗挪回旋转前贴的那条边。
++    // 只改坐标，不负责动画，随后由 viewParent.toDockSide() 统一吸附。
++    private void keepDockEdge(boolean keepLeft, boolean keepTop, boolean dockHorizontal) {
++        if (config.side == FloatDockSide.DEFAULT) return;
++        Rect showArea = getShowArea();
++        switch (config.side) {
++            case LEFT -> params.x = showArea.left;
++            case RIGHT -> params.x = showArea.right;
++            case TOP -> params.y = showArea.top;
++            case BOTTOM -> params.y = showArea.bottom;
++            case HORIZONTAL -> params.x = keepLeft ? showArea.left : showArea.right;
++            case VERTICAL -> params.y = keepTop ? showArea.top : showArea.bottom;
++            case SIDE -> {
++                // 四边吸附：先判断原来靠的是左右还是上下，再决定动哪个轴
++                if (dockHorizontal) params.x = keepLeft ? showArea.left : showArea.right;
++                else params.y = keepTop ? showArea.top : showArea.bottom;
++            }
++        }
++    }
++
+     // 设置窗口位置
+     void setRelativePoint(EAnchor anchor, EAnchor gravity, Point relativePoint) {
+         Rect showArea = getShowArea();
+@@ -291,12 +378,33 @@ public class FloatWindowHelper {
          showArea.right -= config.border.right;
          showArea.bottom -= config.border.bottom;
  
